@@ -1,0 +1,42 @@
+steps:
+  - label: ":docker: Build and Push Docker Image (AMD64)"
+    key: "build"
+    command: |
+      echo "--- :information_source: Build info"
+      uname -m
+      docker version
+
+      echo "--- :key: Login to registry"
+      echo "$BUILDKITE_REGISTRY_TOKEN" | docker login packages.buildkite.com -u "$BUILDKITE_REGISTRY_USER" --password-stdin
+
+      echo "--- :docker: Build AMD64 image"
+      docker build --platform linux/amd64 -t packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_COMMIT .
+
+      echo "--- :label: Tag images"
+      docker tag packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_COMMIT packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:build-$BUILDKITE_BUILD_NUMBER
+
+      if [[ "$BUILDKITE_TAG" != "" ]]; then
+        docker tag packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_COMMIT packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_TAG
+      fi
+
+      if [[ "$BUILDKITE_BRANCH" == "master" || "$BUILDKITE_BRANCH" == "main" ]]; then
+        docker tag packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_COMMIT packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:latest
+      fi
+
+      echo "--- :rocket: Push to registry"
+      docker push packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_COMMIT
+      docker push packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:build-$BUILDKITE_BUILD_NUMBER
+
+      if [[ "$BUILDKITE_TAG" != "" ]]; then
+        echo "--- :rocket: Pushing version tag: $BUILDKITE_TAG"
+        docker push packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_TAG
+      fi
+
+      if [[ "$BUILDKITE_BRANCH" == "master" || "$BUILDKITE_BRANCH" == "main" ]]; then
+        echo "--- :rocket: Pushing latest branch tags"
+        docker push packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:latest
+      fi
+
+env:
+  DOCKER_BUILDKIT: "1"
+  COMPOSE_DOCKER_CLI_BUILD: "1"
