@@ -19,11 +19,10 @@ import (
 var indexHTML []byte
 
 type Config struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	User     string `json:"user"`
-	Password string `json:"password"`
-	KeyFile  string `json:"key_file"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	User    string `json:"user"`
+	KeyFile string `json:"key_file"`
 }
 
 var (
@@ -54,10 +53,6 @@ func loadConfig(path string) error {
 // getSSHClient configures and connects to the SSH server using the loaded config
 func getSSHClient() (*ssh.Client, error) {
 	var authMethods []ssh.AuthMethod
-
-	if config.Password != "" {
-		authMethods = append(authMethods, ssh.Password(config.Password))
-	}
 
 	if config.KeyFile != "" {
 		key, err := os.ReadFile(config.KeyFile)
