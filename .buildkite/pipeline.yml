@@ -9,7 +9,7 @@ steps:
       docker version
 
       echo "--- :key: Login to registry"
-      echo "$BUILDKITE_REGISTRY_TOKEN" | docker login packages.buildkite.com -u "$BUILDKITE_REGISTRY_USER" --password-stdin
+      echo "$BUILDKITE_REGISTRY_TOKEN" | docker login packages.buildkite.com -u "buildkite" --password-stdin
 
       echo "--- :docker: Build AMD64 image"
       docker build --platform linux/amd64 -t packages.buildkite.com/ivydra-dot-com/personal-docker/unas-fan-controller:$BUILDKITE_COMMIT .
