@@ -1,6 +1,8 @@
 steps:
   - label: ":docker: Build and Push Docker Image (AMD64)"
     key: "build"
+    agents:
+      queue: "optiplex"
     command: |
       echo "--- :information_source: Build info"
       uname -m
