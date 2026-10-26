@@ -1,0 +1,1 @@
+fancontrol ALL=(root) NOPASSWD: /usr/local/sbin/unas-disk-temperatures ""

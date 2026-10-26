@@ -11,7 +11,7 @@ RUN go mod download
 COPY . .
 
 # Build for amd64 specifically
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o unas-fan-controller main.go
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o unas-fan-controller .
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates tzdata
