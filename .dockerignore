@@ -1,0 +1,6 @@
+.git
+.amp
+.claude
+config.json
+*.pem
+id_rsa*

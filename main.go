@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -19,211 +24,214 @@ import (
 var indexHTML []byte
 
 type Config struct {
-	Host    string `json:"host"`
-	Port    int    `json:"port"`
-	User    string `json:"user"`
-	KeyFile string `json:"key_file"`
+	Host       string           `json:"host"`
+	Port       int              `json:"port"`
+	User       string           `json:"user"`
+	KeyFile    string           `json:"key_file"`
+	Controller ControllerConfig `json:"controller"`
 }
 
-var (
-	config Config
-	sshMu  sync.Mutex
-)
-
-// loadConfig reads the configuration file from a specified path
-func loadConfig(path string) error {
-	file, err := os.Open(path)
+// The deadline covers TCP, SSH handshake, and command execution, not just dialing.
+func runSSHCommand(ctx context.Context, cfg Config, cmd string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	key, err := os.ReadFile(cfg.KeyFile)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("read SSH key: %w", err)
 	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	if err := decoder.Decode(&config); err != nil {
-		return err
-	}
-
-	if config.Port == 0 {
-		config.Port = 22
-	}
-
-	return nil
-}
-
-// getSSHClient configures and connects to the SSH server using the loaded config
-func getSSHClient() (*ssh.Client, error) {
-	var authMethods []ssh.AuthMethod
-
-	if config.KeyFile != "" {
-		key, err := os.ReadFile(config.KeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("unable to read private key: %w", err)
-		}
-		signer, err := ssh.ParsePrivateKey(key)
-		if err != nil {
-			return nil, fmt.Errorf("unable to parse private key: %w", err)
-		}
-		authMethods = append(authMethods, ssh.PublicKeys(signer))
-	}
-
-	if len(authMethods) == 0 {
-		return nil, fmt.Errorf("no authentication methods provided in config")
-	}
-
-	sshConfig := &ssh.ClientConfig{
-		User:            config.User,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // For an internal NAS, insecure host key is often acceptable
-		Timeout:         5 * time.Second,
-	}
-
-	address := fmt.Sprintf("%s:%d", config.Host, config.Port)
-	client, err := ssh.Dial("tcp", address, sshConfig)
+	signer, err := ssh.ParsePrivateKey(key)
 	if err != nil {
-		return nil, err
+		return "", fmt.Errorf("parse SSH key: %w", err)
 	}
-
-	return client, nil
-}
-
-// runSSHCommand connects via SSH, runs a single command, and returns its standard output text.
-func runSSHCommand(cmd string) (string, error) {
-	sshMu.Lock()
-	defer sshMu.Unlock()
-
-	client, err := getSSHClient()
+	address := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
 	if err != nil {
-		return "", fmt.Errorf("failed to connect to SSH: %w", err)
+		return "", err
 	}
+	defer conn.Close()
+	deadline, _ := ctx.Deadline()
+	if err = conn.SetDeadline(deadline); err != nil {
+		return "", err
+	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	// Preserve the existing SSH trust policy. Restrict this service to the trusted LAN.
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, address, &ssh.ClientConfig{User: cfg.User, Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, HostKeyCallback: ssh.InsecureIgnoreHostKey()})
+	if err != nil {
+		return "", err
+	}
+	client := ssh.NewClient(sshConn, chans, reqs)
 	defer client.Close()
-
 	session, err := client.NewSession()
 	if err != nil {
-		return "", fmt.Errorf("failed to create SSH session: %w", err)
+		return "", err
 	}
 	defer session.Close()
-
-	var stdoutBuf strings.Builder
-	var stderrBuf strings.Builder
-	session.Stdout = &stdoutBuf
-	session.Stderr = &stderrBuf
-
-	if err := session.Run(cmd); err != nil {
-		return "", fmt.Errorf("failed to run command '%s': %w, stderr: %s", cmd, err, stderrBuf.String())
+	var stdout, stderr strings.Builder
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+	if err = session.Run(cmd); err != nil {
+		return "", fmt.Errorf("SSH command failed: %w: %s", err, stderr.String())
 	}
-
-	return stdoutBuf.String(), nil
+	return stdout.String(), nil
 }
 
-func handleSensors(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+func hardwareIO(cfg Config) ControllerIO {
+	return ControllerIO{
+		Ambient: func(ctx context.Context) (float64, error) {
+			return ReadAmbient(ctx, http.DefaultClient, cfg.Controller.HomebridgeURL, cfg.Controller.Accessory)
+		},
+		Disks: func(ctx context.Context) ([]DiskReading, error) {
+			data, err := runSSHCommand(ctx, cfg, "sudo -n /usr/local/sbin/unas-disk-temperatures")
+			if err != nil {
+				return nil, err
+			}
+			return ParseDisks([]byte(data), cfg.Controller.Disks)
+		},
+		ReadPWM: func(ctx context.Context) ([2]int, error) {
+			var pwm [2]int
+			out, err := runSSHCommand(ctx, cfg, "cat /sys/class/hwmon/hwmon0/pwm1 /sys/class/hwmon/hwmon0/pwm2")
+			if err != nil {
+				return pwm, err
+			}
+			fields := strings.Fields(out)
+			if len(fields) != 2 {
+				return pwm, errors.New("expected two PWM values")
+			}
+			for i, f := range fields {
+				n, err := strconv.Atoi(f)
+				if err != nil || n < 0 || n > 255 {
+					return pwm, errors.New("invalid PWM value")
+				}
+				pwm[i] = n
+			}
+			return pwm, nil
+		},
+		WritePWM: func(ctx context.Context, pwm int) error {
+			if pwm < 0 || pwm > 255 {
+				return errors.New("PWM out of range")
+			}
+			_, err := runSSHCommand(ctx, cfg, fmt.Sprintf("echo %d > /sys/class/hwmon/hwmon0/pwm1 && echo %d > /sys/class/hwmon/hwmon0/pwm2", pwm, pwm))
+			return err
+		},
 	}
-
-	output, err := runSSHCommand("sensors")
-	if err != nil {
-		log.Printf("Error running sensors: %v\n", err)
-		http.Error(w, "Failed to get sensors output", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(output))
 }
 
-type FanRequest struct {
-	Speed int `json:"speed"`
+func decodeRequest(w http.ResponseWriter, r *http.Request, v any) error {
+	defer r.Body.Close()
+	d := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	d.DisallowUnknownFields()
+	if err := d.Decode(v); err != nil {
+		return err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return errors.New("expected one JSON object")
+	}
+	return nil
+}
+func jsonResponse(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(v)
 }
 
-func handleFan(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		output, err := runSSHCommand("cat /sys/class/hwmon/hwmon0/pwm1")
+func newMux(c *Controller, sensors func(context.Context) (string, error)) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(indexHTML)
+	})
+	mux.HandleFunc("GET /api/sensors", func(w http.ResponseWriter, r *http.Request) {
+		s, err := sensors(r.Context())
 		if err != nil {
-			log.Printf("Error getting fan speed: %v\n", err)
-			http.Error(w, "Failed to get fan speed", http.StatusInternalServerError)
+			log.Printf("Read sensors: %v", err)
+			http.Error(w, "Failed to get sensors output", 500)
 			return
 		}
-
-		speed := strings.TrimSpace(output)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(fmt.Sprintf(`{"speed": %s}`, speed)))
-		return
-	}
-
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
-	var req FanRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Defensive constraint validation
-	if req.Speed < 0 || req.Speed > 255 {
-		http.Error(w, "Speed must be between 0 and 255", http.StatusBadRequest)
-		return
-	}
-
-	// Security: using strictly parameterized ints, we execute a fixed command template
-	cmd := fmt.Sprintf("echo %d > /sys/class/hwmon/hwmon0/pwm1 && echo %d > /sys/class/hwmon/hwmon0/pwm2", req.Speed, req.Speed)
-
-	_, err = runSSHCommand(cmd)
-	if err != nil {
-		log.Printf("Error setting fan speed: %v\n", err)
-		http.Error(w, "Failed to set fan speed", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status": "success", "message": "Fan speed updated"}`))
-}
-
-func handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html")
-	w.Write(indexHTML)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte(s))
+	})
+	mux.HandleFunc("GET /api/controller", func(w http.ResponseWriter, r *http.Request) { jsonResponse(w, c.Status()) })
+	mux.HandleFunc("POST /api/mode", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Mode string `json:"mode"`
+		}
+		if decodeRequest(w, r, &req) != nil || (req.Mode != "auto" && req.Mode != "manual") {
+			http.Error(w, "Expected mode auto or manual", 400)
+			return
+		}
+		if err := c.SetMode(r.Context(), req.Mode, time.Now()); err != nil {
+			http.Error(w, err.Error(), 409)
+			return
+		}
+		jsonResponse(w, c.Status())
+	})
+	mux.HandleFunc("GET /api/fan", func(w http.ResponseWriter, r *http.Request) {
+		c.op.Lock()
+		pwm, err := c.io.ReadPWM(r.Context())
+		c.op.Unlock()
+		if err != nil {
+			http.Error(w, "Failed to get fan speed", 500)
+			return
+		}
+		jsonResponse(w, struct {
+			Speed int `json:"speed"`
+		}{pwm[0]})
+	})
+	mux.HandleFunc("POST /api/fan", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Speed *int `json:"speed"`
+		}
+		if decodeRequest(w, r, &req) != nil || req.Speed == nil || *req.Speed < 0 || *req.Speed > 255 {
+			http.Error(w, "Speed must be an integer between 0 and 255", 400)
+			return
+		}
+		if err := c.SetManual(r.Context(), *req.Speed, time.Now()); err != nil {
+			log.Printf("Manual fan update: %v", err)
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		jsonResponse(w, map[string]string{"status": "success", "message": "Fan speed updated"})
+	})
+	return mux
 }
 
 func main() {
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "config.json"
+	path := os.Getenv("CONFIG_PATH")
+	if path == "" {
+		path = "config.json"
 	}
-
-	if err := loadConfig(configPath); err != nil {
-		log.Fatalf("Failed to load configuration from %s: %v", configPath, err)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	log.Printf("Configuration loaded for UNAS at %s:%d (User: %s)", config.Host, config.Port, config.User)
-
-	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/api/sensors", handleSensors)
-	http.HandleFunc("/api/fan", handleFan)
-
+	var cfg Config
+	if err = json.Unmarshal(data, &cfg); err != nil {
+		log.Fatal(err)
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 22
+	}
+	controller, err := NewController(cfg.Controller, hardwareIO(cfg), time.Now())
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	go controller.Run(ctx)
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-
-	log.Printf("Starting HTTP server on port %s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("Server failed to start: %v", err)
+	server := &http.Server{Addr: ":" + port, Handler: newMux(controller, func(ctx context.Context) (string, error) { return runSSHCommand(ctx, cfg, "sensors") }), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	go func() {
+		<-ctx.Done()
+		stop, done := context.WithTimeout(context.Background(), 5*time.Second)
+		defer done()
+		server.Shutdown(stop)
+	}()
+	log.Printf("Starting HTTP server on port %s (mode=%s dry_run=%t)", port, controller.Status().Mode, cfg.Controller.DryRun)
+	if err = server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
 	}
 }

@@ -157,6 +157,15 @@
             color: var(--error-color);
             opacity: 1;
         }
+
+        #controlReadings { min-height: 0; white-space: pre-wrap; color: var(--text-color); }
+        #controlErrors { color: var(--error-color); white-space: pre-wrap; }
+        #controlReason { color: var(--text-muted); }
+        select { padding: 0.5rem; background: var(--bg-color); color: var(--text-color); }
+        @media (max-width: 500px) {
+            body { padding: 1rem; }
+            .card { padding: 1rem; }
+        }
     </style>
 </head>
 
@@ -169,6 +178,18 @@
         </header>
 
         <div class="card">
+            <h2>Automatic Cooling <span id="dryRun"></span></h2>
+            <label for="controlMode">Mode</label>
+            <select id="controlMode" onchange="setMode(this.value)" disabled>
+                <option value="manual">Manual</option>
+                <option value="auto">Automatic</option>
+            </select>
+            <p id="controlReason">Loading controller status...</p>
+            <pre id="controlReadings">Waiting for readings</pre>
+            <p id="controlErrors" role="alert"></p>
+        </div>
+
+        <div class="card">
             <h2>
                 Temperature Sensors
                 <button class="refresh-btn" onclick="fetchSensors()">Refresh</button>
@@ -178,6 +199,7 @@
 
         <div class="card">
             <h2>Fan Speed Control</h2>
+            <p>Moving the slider selects manual mode and disables automatic protection.</p>
             <div class="slider-container">
                 <div class="slider-header">
                     <label for="fanSlider">Target Speed: 0 (Off) to 255 (Max)</label>
@@ -203,8 +225,68 @@
         }
 
         let debounceTimer;
+        let editing = false;
+        let busy = false;
+
+        function observedAt(value) {
+            return value && !value.startsWith('0001-') ? new Date(value).toLocaleTimeString() : 'not yet read';
+        }
+
+        async function fetchController() {
+            try {
+                const response = await fetch('/api/controller');
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const s = await response.json();
+                const mode = document.getElementById('controlMode');
+                mode.value = s.mode;
+                mode.disabled = busy || !s.available;
+                document.getElementById('fanSlider').disabled = busy || s.dry_run;
+                document.getElementById('dryRun').textContent = s.dry_run ? 'Dry run' : '';
+                document.getElementById('controlReason').textContent = s.mode === 'manual'
+                    ? 'Manual mode: automatic protection is off.' : s.reason;
+                const lines = [
+                    `Cupboard: ${s.ambient == null ? 'unavailable' : s.ambient.toFixed(1) + '°C'} (read ${observedAt(s.ambient_at)})`,
+                    ...(s.disks || []).map(d => `${d.device}: ${d.standby ? 'standby' : d.temperature == null ? 'unavailable' : d.temperature + '°C'} (read ${observedAt(d.sampled_at)})${d.error ? ' · ' + d.error : ''}`),
+                    `Observed PWM: ${observedAt(s.pwm_at) === 'not yet read' ? 'unavailable' : s.pwm.join(' / ')} (read ${observedAt(s.pwm_at)})`,
+                    `Requested PWM: ${s.desired_pwm}`,
+                    `Next ordinary change: ${observedAt(s.next_ordinary_at)}`,
+                    s.dry_run ? 'Preview only: all hardware writes are disabled.' : s.mode === 'auto' ? 'Safety increases may happen immediately.' : 'No automatic changes in manual mode.'
+                ];
+                document.getElementById('controlReadings').textContent = lines.join('\n');
+                document.getElementById('controlErrors').textContent = [s.read_error, s.write_error, s.state_error].filter(Boolean).join('\n');
+                if (!editing && !busy && observedAt(s.pwm_at) !== 'not yet read') {
+                    document.getElementById('fanSlider').value = s.pwm[0];
+                    updateSliderValue(s.pwm[0]);
+                }
+            } catch (error) {
+                document.getElementById('controlErrors').textContent = `Status unavailable: ${error.message}. Displayed readings may be old.`;
+            }
+        }
+
+        async function setMode(mode) {
+            clearTimeout(debounceTimer);
+            editing = false;
+            busy = true;
+            document.getElementById('controlMode').disabled = true;
+            document.getElementById('fanSlider').disabled = true;
+            try {
+                const response = await fetch('/api/mode', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mode})
+                });
+                if (!response.ok) throw new Error(await response.text());
+                document.getElementById('statusMessage').textContent = '';
+            } catch (error) {
+                document.getElementById('statusMessage').textContent = `Mode change failed: ${error.message}`;
+                document.getElementById('statusMessage').className = 'status error';
+            } finally {
+                busy = false;
+                await fetchController();
+            }
+        }
 
         function handleSliderInput(val) {
+            editing = true;
             updateSliderValue(val);
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => {
@@ -235,6 +317,9 @@
         async function setFanSpeed(val) {
             const speed = parseInt(val, 10);
             const statusEl = document.getElementById('statusMessage');
+            busy = true;
+            document.getElementById('controlMode').disabled = true;
+            document.getElementById('fanSlider').disabled = true;
 
             try {
                 const response = await fetch('/api/fan', {
@@ -261,6 +346,10 @@
                 console.error("Failed to set fan speed:", error);
                 statusEl.textContent = `Error updating fan speed: ${error.message}`;
                 statusEl.className = 'status error';
+            } finally {
+                busy = false;
+                editing = false;
+                await fetchController();
             }
         }
 
@@ -285,7 +374,9 @@
 
         // Initial fetch and set interval
         fetchInitialFanSpeed();
+        fetchController();
         fetchSensors();
+        setInterval(fetchController, 5000);
         setInterval(fetchSensors, 10000); // refresh every 10 seconds
     </script>
 </body>

@@ -1,6 +1,14 @@
 {
   "host": "192.168.1.100",
   "port": 22,
-  "user": "root",
-  "key_file": "/home/user/.ssh/id_rsa"
+  "user": "fancontrol",
+  "key_file": "/home/user/.ssh/id_rsa",
+  "controller": {
+    "homebridge_url": "http://homebridge-cupboard.homebridge.svc.cluster.local:30584",
+    "accessory": "0xa4c1384342a40d40",
+    "disks": ["/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd", "/dev/sde"],
+    "state_path": "/state/controller.json",
+    "mode": "manual",
+    "dry_run": true
+  }
 }
