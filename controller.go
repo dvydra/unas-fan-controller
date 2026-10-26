@@ -14,35 +14,38 @@ import (
 )
 
 type ControllerConfig struct {
-	HomebridgeURL string   `json:"homebridge_url"`
-	Accessory     string   `json:"accessory"`
-	Disks         []string `json:"disks"`
-	StatePath     string   `json:"state_path"`
-	Mode          string   `json:"mode"`
-	DryRun        bool     `json:"dry_run"`
+	HomebridgeURL string            `json:"homebridge_url"`
+	Accessory     string            `json:"accessory"`
+	Disks         []string          `json:"disks"`
+	StatePath     string            `json:"state_path"`
+	Mode          string            `json:"mode"`
+	DryRun        bool              `json:"dry_run"`
+	Experiment    *ExperimentConfig `json:"experiment,omitempty"`
 }
 type ControllerIO struct {
-	Ambient  func(context.Context) (float64, error)
-	Disks    func(context.Context) ([]DiskReading, error)
-	ReadPWM  func(context.Context) ([2]int, error)
-	WritePWM func(context.Context, int) error
+	Ambient   func(context.Context) (float64, error)
+	Disks     func(context.Context) ([]DiskReading, error)
+	ReadPWM   func(context.Context) ([2]int, error)
+	WritePWM  func(context.Context, int) error
+	Telemetry func(context.Context) (Telemetry, error)
 }
 type ControllerStatus struct {
-	Available      bool          `json:"available"`
-	Mode           string        `json:"mode"`
-	DryRun         bool          `json:"dry_run"`
-	Ambient        *float64      `json:"ambient,omitempty"`
-	AmbientAt      time.Time     `json:"ambient_at"`
-	Disks          []DiskReading `json:"disks"`
-	PWM            [2]int        `json:"pwm"`
-	PWMAt          time.Time     `json:"pwm_at"`
-	DesiredPWM     int           `json:"desired_pwm"`
-	Reason         string        `json:"reason"`
-	LastChange     time.Time     `json:"last_change"`
-	NextOrdinaryAt time.Time     `json:"next_ordinary_at"`
-	ReadError      string        `json:"read_error,omitempty"`
-	WriteError     string        `json:"write_error,omitempty"`
-	StateError     string        `json:"state_error,omitempty"`
+	Available      bool              `json:"available"`
+	Mode           string            `json:"mode"`
+	DryRun         bool              `json:"dry_run"`
+	Ambient        *float64          `json:"ambient,omitempty"`
+	AmbientAt      time.Time         `json:"ambient_at"`
+	Disks          []DiskReading     `json:"disks"`
+	PWM            [2]int            `json:"pwm"`
+	PWMAt          time.Time         `json:"pwm_at"`
+	DesiredPWM     int               `json:"desired_pwm"`
+	Reason         string            `json:"reason"`
+	LastChange     time.Time         `json:"last_change"`
+	NextOrdinaryAt time.Time         `json:"next_ordinary_at"`
+	ReadError      string            `json:"read_error,omitempty"`
+	WriteError     string            `json:"write_error,omitempty"`
+	StateError     string            `json:"state_error,omitempty"`
+	Experiment     *ExperimentStatus `json:"experiment,omitempty"`
 }
 type persistedState struct {
 	Mode       string    `json:"mode"`
@@ -51,12 +54,13 @@ type persistedState struct {
 }
 type Controller struct {
 	// op serializes sampling and manual changes, including I/O. mu only protects snapshots.
-	op    sync.Mutex
-	mu    sync.RWMutex
-	cfg   ControllerConfig
-	io    ControllerIO
-	state ControllerStatus
-	disks map[string]DiskReading
+	op         sync.Mutex
+	mu         sync.RWMutex
+	cfg        ControllerConfig
+	io         ControllerIO
+	state      ControllerStatus
+	disks      map[string]DiskReading
+	experiment *Experiment
 }
 
 func NewController(cfg ControllerConfig, io ControllerIO, now time.Time) (*Controller, error) {
@@ -100,6 +104,19 @@ func NewController(cfg ControllerConfig, io ControllerIO, now time.Time) (*Contr
 			return nil, fmt.Errorf("write controller state: %w", err)
 		}
 	}
+	if cfg.Experiment != nil {
+		u, err := url.Parse(cfg.Experiment.RoomURL)
+		if !available || io.Telemetry == nil || err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || cfg.Experiment.RoomAccessory == "" {
+			return nil, errors.New("experiment requires controller configuration and room telemetry")
+		}
+		c.experiment, err = newExperiment(filepath.Dir(cfg.StatePath), cfg.Experiment.ID, now)
+		if err != nil {
+			// Failed experiment storage must not take the cooling controller offline.
+			c.experiment = &Experiment{status: ExperimentStatus{ID: cfg.Experiment.ID, Phase: "aborted", Reason: "Experiment initialization failed", Error: err.Error(), Recovery: true}}
+		}
+		s := c.experiment.status
+		c.state.Experiment = &s
+	}
 	return c, nil
 }
 
@@ -133,6 +150,10 @@ func (c *Controller) Status() ControllerStatus {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	s := c.state
+	if s.Experiment != nil {
+		e := *s.Experiment
+		s.Experiment = &e
+	}
 	s.Disks = append([]DiskReading(nil), s.Disks...)
 	if s.Ambient != nil {
 		v := *s.Ambient
@@ -160,7 +181,14 @@ func (c *Controller) Sample(ctx context.Context, now time.Time) {
 	c.op.Lock()
 	defer c.op.Unlock()
 	s := c.Status()
-	defer func() { c.publish(s) }()
+	var telemetry Telemetry
+	var telemetryErr error
+	defer func() {
+		if c.experiment != nil {
+			c.experiment.finish(now, &s, telemetry, telemetryErr)
+		}
+		c.publish(s)
+	}()
 	var errs []error
 	pwm, err := c.io.ReadPWM(ctx)
 	if err != nil {
@@ -230,6 +258,10 @@ func (c *Controller) Sample(ctx context.Context, now time.Time) {
 		s.Disks = append(s.Disks, d)
 	}
 	s.ReadError = errorText(errors.Join(errs...))
+	if c.experiment != nil && c.experiment.active() {
+		telemetry, telemetryErr = c.io.Telemetry(ctx)
+		telemetry.SampledAt = now
+	}
 	if s.Mode != "auto" {
 		s.Reason = "Manual mode; automatic protection disabled"
 		s.DesiredPWM = max(pwm[0], pwm[1])
@@ -243,6 +275,11 @@ func (c *Controller) Sample(ctx context.Context, now time.Time) {
 	decision := Decide(in)
 	if hotNow {
 		decision = Decision{255, "Disk at or above 50°C", true}
+	}
+	if c.experiment != nil {
+		if d := c.experiment.decide(now, s, telemetry, telemetryErr); d != nil && (!decision.Safety || d.PWM >= decision.PWM) {
+			decision = *d
+		}
 	}
 	// Never reduce speed based on cached data during a transient failure.
 	if (len(errs) > 0 || s.StateError != "") && decision.PWM < in.Current {
@@ -265,7 +302,10 @@ func (c *Controller) Sample(ctx context.Context, now time.Time) {
 		s.Reason = "Dry run: " + decision.Reason
 		return
 	}
-	c.write(ctx, &s, decision.PWM, now.Add(time.Since(started)))
+	err = c.write(ctx, &s, decision.PWM, now.Add(time.Since(started)))
+	if c.experiment != nil {
+		c.experiment.fanEvent(now.Add(time.Since(started)), s, decision.PWM, err)
+	}
 }
 
 func (c *Controller) write(ctx context.Context, s *ControllerStatus, pwm int, now time.Time) error {
@@ -318,6 +358,11 @@ func (c *Controller) SetMode(ctx context.Context, mode string, now time.Time) er
 	if mode == "auto" && !s.Available {
 		return errors.New("automatic control not configured")
 	}
+	if mode == "manual" && c.experiment != nil {
+		c.experiment.stop("cancelled", "Manual mode selected", now, false)
+		e := c.experiment.status
+		s.Experiment = &e
+	}
 	if s.Mode == mode {
 		return nil
 	}
@@ -345,6 +390,11 @@ func (c *Controller) SetManual(ctx context.Context, pwm int, now time.Time) erro
 		return errors.New("hardware writes disabled in dry-run mode")
 	}
 	// Suspend automatic control before attempting a manual write, even if it fails.
+	if c.experiment != nil {
+		c.experiment.stop("cancelled", "Manual fan override", now, false)
+		e := c.experiment.status
+		s.Experiment = &e
+	}
 	s.Mode = "manual"
 	s.Reason = "Manual override"
 	s.NextOrdinaryAt = now.Add(holdPeriod)
@@ -354,6 +404,11 @@ func (c *Controller) SetManual(ctx context.Context, pwm int, now time.Time) erro
 		return err
 	}
 	err := c.write(ctx, &s, pwm, now.Add(time.Since(started)))
+	if c.experiment != nil {
+		c.experiment.fanEvent(now.Add(time.Since(started)), s, pwm, err)
+		e := c.experiment.status
+		s.Experiment = &e
+	}
 	c.publish(s)
 	return err
 }
