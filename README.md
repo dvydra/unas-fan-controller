@@ -139,3 +139,24 @@ ssh root@192.168.1.234 'visudo -cf /root/unas-fan-staging/fancontrol-temperature
 ```
 
 The helper and its parent directories must remain root-owned and not writable by `fancontrol`. Keep the existing PWM permissions service unchanged. Publish an immutable app image and pin that image before deploying the prepared manifests. Observe dry-run for two ten-minute intervals before enabling writes; installation alone does not enable automatic control.
+
+## Thermal experiment
+
+An optional `controller.experiment` object arms one experiment. It requires `id` (1–64 letters, digits or hyphens, starting with a letter or digit), `room_url` (internal Homebridge child-bridge URL) and `room_accessory` (exact accessory name, `living` for AirTouch Living). Keep the cupboard configuration unchanged. Deploy an image containing this feature before enabling the configuration. The existing controller remains the only fan writer.
+
+In Automatic mode with dry-run off, all disks must stay below 40°C with valid readings for thirty continuous minutes. Normal cooling continues during this baseline. The experiment then holds 36 blocks of at least two hours each, using PWM 48, 56 and 64 twelve times each. The first block uses 64. Each two-hour time-of-day slot receives all three speeds across three days, subject to polling and write delays. The ten-minute hold still applies to ordinary writes. During running blocks the experiment replaces the normal ambient floor and 35–40°C target; it does not replace emergency cooling.
+
+Any disk reaching 45°C, missing room/cupboard/disk/RPM/activity data, a polling gap over 90 seconds, external PWM changes, or read/write failure aborts the experiment. It requests at least 167 PWM without reducing a faster fan. The normal 50°C emergency still requests 255. A failed write or recording failure may require the next polling cycle to request fallback cooling. Successful fallback returns control to the normal policy; a storage error keeps fallback active until repaired. Manual mode or a slider change cancels the experiment and disables automatic protection, as before.
+
+Restarting during a running block aborts it as incomplete. Restarting during baseline resets the thirty-minute timer. Completed, cancelled and aborted IDs never automatically rearm. A new experiment requires a new ID. Corrupt experiment state disables the experiment while keeping cooling available. The existing limitations still apply: a stopped controller cannot change fans, and a successful Homebridge read does not prove the physical sensor recently reported.
+
+### Capture and results
+
+The state volume holds `experiments/<id>/state.json`, `samples.jsonl` and `events.jsonl`. Samples are appended and synced once per UTC minute while baseline/running, plus a final terminal sample. Events record phase changes and attempted fan writes with readback. Each capture file is capped at 32 MiB; reaching the cap aborts rather than discarding old data. Keep the volume after the experiment finishes.
+
+- `GET /api/controller`: experiment phase, block (zero-based), target PWM, timers and abort reason alongside normal controller status.
+- `GET /api/experiment/samples.jsonl`: temperatures, timestamps, errors, requested/observed PWM, both RPM readings, NAS uptime and per-disk cumulative activity counters.
+- `GET /api/experiment/samples.csv`: one row per disk per sample, suitable for analysis. Sector counters use 512-byte units. Compute deltas only across increasing uptime and counters.
+- `GET /api/experiment/events.jsonl`: block boundaries, incomplete-block reasons and fan-write outcomes. Downloads are read-only and do not change the experiment. Invalid or crash-truncated JSON makes CSV export fail explicitly; the original JSONL remains downloadable for recovery.
+
+Analyse completed blocks separately from baseline and aborted blocks. Plot room, cupboard and disk temperatures with measured PWM/RPM and disk activity. Compare the final thirty minutes of each block using cupboard-minus-room and disk-minus-room temperature, checking whether temperatures actually settled. Fit room temperature, fan speed and disk activity jointly, include disk-specific effects, and report uncertainty across blocks rather than treating minute samples as independent experiments. Estimate response times from block transitions. If room temperature barely varies, report that its effect cannot be identified reliably. Do not change the production cooling curve automatically from this first run.

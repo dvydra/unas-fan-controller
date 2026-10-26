@@ -249,7 +249,9 @@
                     ...(s.disks || []).map(d => `${d.device}: ${d.standby ? 'standby' : d.temperature == null ? 'unavailable' : d.temperature + '°C'} (read ${observedAt(d.sampled_at)})${d.error ? ' · ' + d.error : ''}`),
                     `Observed PWM: ${observedAt(s.pwm_at) === 'not yet read' ? 'unavailable' : s.pwm.join(' / ')} (read ${observedAt(s.pwm_at)})`,
                     `Requested PWM: ${s.desired_pwm}`,
-                    `Next ordinary change: ${observedAt(s.next_ordinary_at)}`,
+                    new Date(s.next_ordinary_at).getTime() > Date.now()
+                        ? `Cooldown ends: ${observedAt(s.next_ordinary_at)}`
+                        : 'Cooldown complete: changes allowed when needed.',
                     s.dry_run ? 'Preview only: all hardware writes are disabled.' : s.mode === 'auto' ? 'Safety increases may happen immediately.' : 'No automatic changes in manual mode.'
                 ];
                 document.getElementById('controlReadings').textContent = lines.join('\n');

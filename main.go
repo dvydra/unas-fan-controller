@@ -78,6 +78,7 @@ func runSSHCommand(ctx context.Context, cfg Config, cmd string) (string, error) 
 
 func hardwareIO(cfg Config) ControllerIO {
 	return ControllerIO{
+		Telemetry: func(ctx context.Context) (Telemetry, error) { return readTelemetry(ctx, cfg) },
 		Ambient: func(ctx context.Context) (float64, error) {
 			return ReadAmbient(ctx, http.DefaultClient, cfg.Controller.HomebridgeURL, cfg.Controller.Accessory)
 		},
@@ -152,6 +153,7 @@ func newMux(c *Controller, sensors func(context.Context) (string, error)) *http.
 		w.Write([]byte(s))
 	})
 	mux.HandleFunc("GET /api/controller", func(w http.ResponseWriter, r *http.Request) { jsonResponse(w, c.Status()) })
+	mux.HandleFunc("GET /api/experiment/{file}", c.experimentDownload)
 	mux.HandleFunc("POST /api/mode", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Mode string `json:"mode"`
