@@ -2,7 +2,7 @@
 
 A simple, secure, and responsive web application to safely monitor temperatures and control fan speeds on UNAS devices remotely via SSH.
 
-This lightweight Go application provides a beautiful Material Design web interface for your NAS, allowing you to check system sensor data and adjust fan speeds seamlessly without directly exposing root credentials to potential attackers.
+The Server cooling page shows disk and cupboard temperatures, fan state and experiment progress. The Go service reads sensors and controls the NAS through SSH.
 
 ## Features
 
@@ -10,7 +10,7 @@ This lightweight Go application provides a beautiful Material Design web interfa
 - **Fan Adjustments**: A simple UI slider allows for dynamically adjusting standard fan pulse-width modulation (`pwm1` and `pwm2`) variables.
 - **Defensive API**: Pre-calculated commands are sent over the SSH connection; arbitrary command execution from the web interface is not possible.
 - **Extremely Lightweight**: Built purely in Go using the standard library (and x/crypto/ssh for connectivity), with no other heavy dependencies or external front-end framework files required (embedded HTML).
-- **Dark Mode UI**: Responsive and modern single-page frontend.
+- **Server cooling dashboard**: Celsius-only readings, experiment downloads and explicit manual controls, on desktop and mobile.
 
 ## Prerequisites
 
@@ -118,7 +118,7 @@ The controller samples every 30 seconds. Ordinary changes wait at least ten minu
 
 In Automatic mode, a disk at 50°C requests 255 immediately. Required readings missing for 90 seconds request at least 167 without reducing a faster fan. No usable startup readings trigger fallback immediately. Sleeping disks are not awakened; if all disks sleep, fallback applies. Reductions wait for fresh readings and the ten-minute hold. Both fan values are read back, and partial writes remain errors. Failed or interrupted writes reserve an extra 40 seconds for the bounded write/readback calls before ordinary changes can resume.
 
-Selecting Manual stops automatic changes and automatic safety protection. Moving the slider also selects Manual. Manual changes remain immediate. The page shows sample times and read/write errors; `GET /api/controller` exposes the same status. `POST /api/mode` accepts `{"mode":"auto"}` or `{"mode":"manual"}`.
+Selecting Manual stops automatic changes and automatic safety protection. Moving the slider only edits a draft speed; Apply manual speed asks for confirmation before selecting Manual and writing the fans. The page disables writes during dry-run, stale status and connection loss. The page shows sample times and read/write errors; `GET /api/controller` exposes the same status. `POST /api/mode` accepts `{"mode":"auto"}` or `{"mode":"manual"}`.
 
 ### Limitations
 
