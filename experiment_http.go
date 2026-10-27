@@ -9,18 +9,20 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 )
 
 func (c *Controller) experimentDownload(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("file")
-	if name != "samples.jsonl" && name != "samples.csv" && name != "events.jsonl" {
+	derived := map[string]func([]byte) ([]byte, error){"samples.csv": experimentCSV, "blocks.csv": experimentBlocksCSV, "pairs.csv": experimentPairsCSV}
+	if name != "samples.jsonl" && name != "events.jsonl" && derived[name] == nil {
 		http.NotFound(w, r)
 		return
 	}
 	source := name
-	if name == "samples.csv" {
+	if derived[name] != nil {
 		source = "samples.jsonl"
 	}
 	// Snapshot under the sampling lock, then release it before serving a slow client.
@@ -36,8 +38,8 @@ func (c *Controller) experimentDownload(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Capture unavailable", 503)
 		return
 	}
-	if name == "samples.csv" {
-		data, err = experimentCSV(data)
+	if convert := derived[name]; convert != nil {
+		data, err = convert(data)
 		if err != nil {
 			http.Error(w, "Capture contains invalid JSON", 500)
 			return
@@ -88,6 +90,141 @@ func experimentCSV(data []byte) ([]byte, error) {
 	}
 	if err := scan.Err(); err != nil {
 		return nil, err
+	}
+	writer.Flush()
+	return out.Bytes(), writer.Error()
+}
+
+type blockSummary struct {
+	block, pwm              int
+	start, last             time.Time
+	settled                 int
+	hottest, cupboard, room float64
+	roomSamples             int
+}
+
+func (b blockSummary) complete() bool { return b.last.Sub(b.start) >= experimentBlock-2*time.Minute }
+func (b blockSummary) rise() float64  { return b.hottest - b.cupboard }
+
+// summariseBlocks averages the settled second half of each block's latest hold.
+// Cupboard temperature is subtracted per block so speeds compare at equivalent ambient.
+func summariseBlocks(data []byte) ([]blockSummary, error) {
+	type key struct {
+		block int
+		start time.Time
+	}
+	attempts := map[key]*blockSummary{}
+	scan := bufio.NewScanner(bytes.NewReader(data))
+	scan.Buffer(make([]byte, 4096), 1<<20)
+	for scan.Scan() {
+		var s ExperimentSample
+		if err := json.Unmarshal(scan.Bytes(), &s); err != nil {
+			return nil, err
+		}
+		e := s.Controller.Experiment
+		if e == nil || e.Phase != "running" || e.BlockStartedAt.IsZero() || s.Controller.Ambient == nil || s.Time.Before(e.BlockStartedAt) {
+			continue
+		}
+		hottest, ok := 0.0, false
+		for _, d := range s.Controller.Disks {
+			if !d.Standby && d.Temperature != nil && d.Error == "" {
+				hottest, ok = max(hottest, *d.Temperature), true
+			}
+		}
+		if !ok {
+			continue
+		}
+		k := key{e.Block, e.BlockStartedAt.UTC()}
+		b := attempts[k]
+		if b == nil {
+			b = &blockSummary{block: e.Block, pwm: e.TargetPWM, start: k.start}
+			attempts[k] = b
+		}
+		b.last = s.Time
+		if s.Time.Sub(b.start) < experimentBlock/2 {
+			continue
+		}
+		b.settled++
+		b.hottest += hottest
+		b.cupboard += *s.Controller.Ambient
+		if s.Telemetry.Room != nil {
+			b.roomSamples++
+			b.room += *s.Telemetry.Room
+		}
+	}
+	if err := scan.Err(); err != nil {
+		return nil, err
+	}
+	latest := map[int]blockSummary{}
+	for _, b := range attempts {
+		if b.settled > 0 {
+			b.hottest /= float64(b.settled)
+			b.cupboard /= float64(b.settled)
+		}
+		if b.roomSamples > 0 {
+			b.room /= float64(b.roomSamples)
+		}
+		if old, ok := latest[b.block]; !ok || b.start.After(old.start) {
+			latest[b.block] = *b
+		}
+	}
+	out := make([]blockSummary, 0, len(latest))
+	for _, b := range latest {
+		out = append(out, b)
+	}
+	slices.SortFunc(out, func(a, b blockSummary) int { return a.block - b.block })
+	return out, nil
+}
+
+func celsius(v float64) string { return strconv.FormatFloat(v, 'f', 2, 64) }
+
+func experimentBlocksCSV(data []byte) ([]byte, error) {
+	blocks, err := summariseBlocks(data)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	writer := csv.NewWriter(&out)
+	writer.Write([]string{"block", "pair", "target_pwm", "started_at", "complete", "settled_samples", "hottest_c", "cupboard_c", "room_c", "rise_c"})
+	for _, b := range blocks {
+		room := ""
+		if b.roomSamples > 0 {
+			room = celsius(b.room)
+		}
+		writer.Write([]string{strconv.Itoa(b.block + 1), strconv.Itoa(b.block/2 + 1), strconv.Itoa(b.pwm), b.start.Format(time.RFC3339), strconv.FormatBool(b.complete()), strconv.Itoa(b.settled), celsius(b.hottest), celsius(b.cupboard), room, celsius(b.rise())})
+	}
+	writer.Flush()
+	return out.Bytes(), writer.Error()
+}
+
+// experimentPairsCSV compares the two speeds within each adjacent pair of complete blocks,
+// which ran hours apart at similar cupboard temperatures.
+func experimentPairsCSV(data []byte) ([]byte, error) {
+	blocks, err := summariseBlocks(data)
+	if err != nil {
+		return nil, err
+	}
+	pairs := map[int]map[int]blockSummary{}
+	for _, b := range blocks {
+		if !b.complete() {
+			continue
+		}
+		if pairs[b.block/2] == nil {
+			pairs[b.block/2] = map[int]blockSummary{}
+		}
+		pairs[b.block/2][b.pwm] = b
+	}
+	low, high := experimentLevels[0], experimentLevels[1]
+	var out bytes.Buffer
+	writer := csv.NewWriter(&out)
+	writer.Write([]string{"pair", fmt.Sprintf("rise_%d_c", low), fmt.Sprintf("rise_%d_c", high), "rise_difference_c", fmt.Sprintf("cupboard_%d_c", low), fmt.Sprintf("cupboard_%d_c", high), "cupboard_difference_c"})
+	for pair := range experimentBlocks / 2 {
+		a, okA := pairs[pair][low]
+		b, okB := pairs[pair][high]
+		if !okA || !okB {
+			continue
+		}
+		writer.Write([]string{strconv.Itoa(pair + 1), celsius(a.rise()), celsius(b.rise()), celsius(a.rise() - b.rise()), celsius(a.cupboard), celsius(b.cupboard), celsius(a.cupboard - b.cupboard)})
 	}
 	writer.Flush()
 	return out.Bytes(), writer.Error()

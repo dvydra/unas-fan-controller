@@ -127,10 +127,10 @@
                     <div class="experiment-title"><strong id="experimentTitle">Normal cooling</strong></div>
                     <p id="experimentReason">No experiment is armed.</p>
                     <div id="experimentDetails" hidden>
-                        <div id="blocks" class="blocks" role="img" aria-label="36 experiment blocks"></div>
-                        <div class="fact"><span>36 two-hour blocks</span><b>48 / 56 / 64 PWM</b></div>
+                        <div id="blocks" class="blocks" role="img" aria-label="Experiment blocks"></div>
+                        <div class="fact"><span>48 two-hour blocks, in adjacent pairs</span><b>38 (stock) vs 56 PWM</b></div>
                         <p id="experimentTiming"></p>
-                        <div class="downloads"><a href="/api/experiment/samples.csv" download>Download CSV</a><a href="/api/experiment/samples.jsonl" download>Raw samples</a><a href="/api/experiment/events.jsonl" download>Event log</a></div>
+                        <div class="downloads"><a href="/api/experiment/pairs.csv" download>Pair comparison</a><a href="/api/experiment/blocks.csv" download>Block summary</a><a href="/api/experiment/samples.csv" download>Download CSV</a><a href="/api/experiment/samples.jsonl" download>Raw samples</a><a href="/api/experiment/events.jsonl" download>Event log</a></div>
                     </div>
                 </div>
             </section>
@@ -218,15 +218,16 @@
         const e=s.experiment;
         $('experimentDetails').hidden=!e;
         badge('experimentPhase',e ? e.phase[0].toUpperCase()+e.phase.slice(1) : 'Not configured',e && ['aborted','cancelled'].includes(e.phase)?'warn':'');
-        text('experimentTitle',!e ? 'Normal cooling' : e.phase==='baseline' ? 'Qualifying baseline' : e.phase==='running' ? `Block ${e.block+1} of 36` : e.phase==='completed' ? 'Capture complete' : 'Experiment stopped');
+        text('experimentTitle',!e ? 'Normal cooling' : e.phase==='baseline' ? 'Qualifying baseline' : e.phase==='running' ? `Block ${e.block+1} of ${e.total_blocks||36}` : e.phase==='completed' ? 'Capture complete' : 'Experiment stopped');
         text('experimentReason',e ? e.reason : 'No experiment is armed.');
         if(e) {
             $('blocks').replaceChildren();
-            const completed=e.phase==='completed'?36:Math.max(0,e.block);
-            for(let i=0;i<36;i++){const tick=document.createElement('i');tick.className=i<completed?'done':e.phase==='running'&&i===e.block?'current':'';$('blocks').append(tick);}
-            $('blocks').setAttribute('aria-label',`${completed} of 36 blocks completed`);
+            const total=e.total_blocks||36;
+            const completed=e.phase==='completed'?total:Math.max(0,e.block);
+            for(let i=0;i<total;i++){const tick=document.createElement('i');tick.className=i<completed?'done':e.phase==='running'&&i===e.block?'current':'';$('blocks').append(tick);}
+            $('blocks').setAttribute('aria-label',`${completed} of ${total} blocks completed`);
             const elapsed=validTime(e.cool_since)?Math.max(0,Math.floor((Date.now()-Date.parse(e.cool_since))/60000)):0;
-            text('experimentTiming',e.phase==='baseline'?`${Math.min(30,elapsed)} of 30 qualifying minutes. Every disk must stay below 40°C.`:e.phase==='running'?`Holding ${e.target_pwm} PWM. Block started ${time(e.block_started_at)}. Abort at 45°C.`:'Captured data remains available below.');
+            text('experimentTiming',e.phase==='baseline'?`${Math.min(30,elapsed)} of 30 qualifying minutes. Every disk must stay below 40°C.`:e.phase==='running'?`Holding ${e.target_pwm} PWM. Block started ${time(e.block_started_at)}. Abort at 49°C. Lost readings restart the block.`:'Captured data remains available below.');
         }
         const errors=[s.read_error,s.write_error,s.state_error,e?.error,!current?'Controller readings are stale. Displayed data may be old.':''].filter(Boolean);
         text('controlErrors',errors.join('\n'));$('controlErrors').hidden=!errors.length;
