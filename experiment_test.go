@@ -38,15 +38,19 @@ func TestExperimentBaselineScheduleAndRestart(t *testing.T) {
 	}
 	c.Sample(context.Background(), now.Add(30*time.Minute))
 	s := c.Status()
-	if s.Experiment.Phase != "running" || f.pwm != [2]int{64, 64} {
+	if s.Experiment.Phase != "running" || f.pwm != [2]int{38, 38} {
 		t.Fatalf("did not start first block: %+v %v", s.Experiment, f.pwm)
 	}
 	c, err := NewController(cfg, io, now.Add(31*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Status().Experiment.Phase != "aborted" {
-		t.Fatal("restart resumed an interrupted block")
+	if e := c.Status().Experiment; e.Phase != "running" || e.Block != 0 || !e.BlockStartedAt.IsZero() {
+		t.Fatal("restart must restart the interrupted block, not abort or resume it", e)
+	}
+	c.Sample(context.Background(), now.Add(31*time.Minute+30*time.Second))
+	if e := c.Status().Experiment; e.Phase != "running" || e.Block != 0 || e.BlockStartedAt.IsZero() || f.pwm != [2]int{38, 38} {
+		t.Fatal("interrupted block did not restart", e, f.pwm)
 	}
 	data, err := os.ReadFile(filepath.Join(filepath.Dir(cfg.StatePath), "experiments", "test", "samples.jsonl"))
 	if err != nil {
@@ -64,10 +68,11 @@ func TestExperimentFullSchedule(t *testing.T) {
 	counts := map[int]int{}
 	previous := -1
 	blocks := 0
-	slots := [12]map[int]bool{}
+	slots := [12]map[int]int{}
+	pairs := map[int]map[int]bool{}
 	var lastBlock time.Time
 	// Run the real controller across the full experiment with a controlled clock.
-	for i := 0; i <= int((73*time.Hour)/(30*time.Second)); i++ {
+	for i := 0; i <= int((experimentBlocks*2*time.Hour+time.Hour)/(30*time.Second)); i++ {
 		c.Sample(context.Background(), now.Add(time.Duration(i)*30*time.Second))
 		s := c.Status()
 		if s.Experiment.Phase == "running" && s.Experiment.Block != previous {
@@ -80,23 +85,33 @@ func TestExperimentFullSchedule(t *testing.T) {
 			lastBlock = s.Experiment.BlockStartedAt
 			slot := previous % 12
 			if slots[slot] == nil {
-				slots[slot] = map[int]bool{}
+				slots[slot] = map[int]int{}
 			}
-			slots[slot][f.pwm[0]] = true
+			slots[slot][f.pwm[0]]++
+			if pairs[previous/2] == nil {
+				pairs[previous/2] = map[int]bool{}
+			}
+			pairs[previous/2][f.pwm[0]] = true
 		}
 	}
-	if c.Status().Experiment.Phase != "completed" || blocks != 36 || counts[48] != 12 || counts[56] != 12 || counts[64] != 12 {
+	if c.Status().Experiment.Phase != "completed" || blocks != 48 || counts[38] != 24 || counts[56] != 24 {
 		t.Fatal(c.Status().Experiment, counts, blocks)
 	}
 	for _, speeds := range slots {
-		if len(speeds) != 3 {
+		if speeds[38] != 2 || speeds[56] != 2 {
 			t.Fatal("unbalanced time-of-day slot", speeds)
+		}
+	}
+	// Adjacent blocks are the ambient-matched comparison, so every pair must contain both speeds.
+	for pair, speeds := range pairs {
+		if len(speeds) != 2 {
+			t.Fatal("pair without both speeds", pair, speeds)
 		}
 	}
 }
 
 func TestExperimentAbortAndManualCancellation(t *testing.T) {
-	for _, scenario := range []string{"hot", "emergency", "missing", "telemetry", "gap", "write", "manual"} {
+	for _, scenario := range []string{"hot", "emergency", "write", "manual"} {
 		t.Run(scenario, func(t *testing.T) {
 			now := time.Unix(100000, 0)
 			f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
@@ -106,13 +121,9 @@ func TestExperimentAbortAndManualCancellation(t *testing.T) {
 			}
 			switch scenario {
 			case "hot":
-				f.disk = 45
+				f.disk = 49
 			case "emergency":
 				f.disk = 50
-			case "missing":
-				f.missing = true
-			case "telemetry":
-				c.io.Telemetry = func(context.Context) (Telemetry, error) { return Telemetry{}, errors.New("room unavailable") }
 			case "write":
 				f.partial = true
 			case "manual":
@@ -124,8 +135,6 @@ func TestExperimentAbortAndManualCancellation(t *testing.T) {
 				for i := 61; i <= 302; i++ {
 					c.Sample(context.Background(), now.Add(time.Duration(i)*30*time.Second))
 				}
-			} else if scenario == "gap" {
-				c.Sample(context.Background(), now.Add(32*time.Minute))
 			} else {
 				c.Sample(context.Background(), now.Add(31*time.Minute))
 			}
@@ -134,7 +143,7 @@ func TestExperimentAbortAndManualCancellation(t *testing.T) {
 				t.Fatal("test did not exercise a failed write")
 			}
 			if scenario == "hot" && f.pwm[0] < 167 {
-				t.Fatal("45°C abort failed to raise cooling")
+				t.Fatal("49°C abort failed to raise cooling")
 			}
 			if scenario == "emergency" && f.pwm != [2]int{255, 255} {
 				t.Fatal("experiment masked emergency cooling", f.pwm)
@@ -221,5 +230,63 @@ func TestExperimentBaselineMustBeContinuous(t *testing.T) {
 	c.Sample(context.Background(), now.Add(50*time.Minute+30*time.Second))
 	if c.Status().Experiment.Phase != "running" {
 		t.Fatal(c.Status().Experiment)
+	}
+}
+
+func TestExperimentToleratesReadingLoss(t *testing.T) {
+	start := func(t *testing.T) (*Controller, *fakeHardware, time.Time) {
+		now := time.Unix(100000, 0)
+		f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
+		c, _, _ := experimentalController(t, f, now)
+		for i := 0; i <= 80; i++ {
+			c.Sample(context.Background(), now.Add(time.Duration(i)*30*time.Second))
+		}
+		if e := c.Status().Experiment; e.Phase != "running" || e.BlockStartedAt.IsZero() {
+			t.Fatal("block not holding", e)
+		}
+		return c, f, now.Add(40 * time.Minute)
+	}
+	t.Run("transient", func(t *testing.T) {
+		c, f, now := start(t)
+		held := c.Status().Experiment.BlockStartedAt
+		// One failed cupboard read, as on 2026-10-26, must not cost the block.
+		f.missing = true
+		c.Sample(context.Background(), now.Add(30*time.Second))
+		f.missing = false
+		c.io.Telemetry = func(context.Context) (Telemetry, error) { return Telemetry{}, errors.New("room unavailable") }
+		c.Sample(context.Background(), now.Add(time.Minute))
+		if e := c.Status().Experiment; e.Phase != "running" || !e.BlockStartedAt.Equal(held) || f.pwm != [2]int{38, 38} {
+			t.Fatal("transient loss disturbed the block", e, f.pwm)
+		}
+	})
+	for _, scenario := range []string{"missing", "gap"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, f, now := start(t)
+			block := c.Status().Experiment.Block
+			next := now.Add(30 * time.Second)
+			if scenario == "missing" {
+				f.missing = true
+				for i := 1; i <= 4; i++ {
+					next = now.Add(time.Duration(i) * 30 * time.Second)
+					c.Sample(context.Background(), next)
+				}
+				if f.pwm[0] < 167 {
+					t.Fatal("lost readings did not fall back to safe cooling", f.pwm)
+				}
+				f.missing = false
+			} else {
+				next = now.Add(5 * time.Minute)
+				c.Sample(context.Background(), next)
+			}
+			if e := c.Status().Experiment; e.Phase != "running" || e.Block != block || !e.BlockStartedAt.IsZero() {
+				t.Fatal("lost readings must restart the block, not abort or keep its data", e)
+			}
+			for i := 1; i <= 25; i++ {
+				c.Sample(context.Background(), next.Add(time.Duration(i)*30*time.Second))
+			}
+			if e := c.Status().Experiment; e.Phase != "running" || e.Block != block || e.BlockStartedAt.IsZero() || f.pwm != [2]int{38, 38} {
+				t.Fatal("block did not restart after readings returned", e, f.pwm)
+			}
+		})
 	}
 }

@@ -10,6 +10,16 @@ import (
 	"time"
 )
 
+const (
+	experimentBlocks = 48
+	experimentBlock  = 2 * time.Hour
+	// Stock firmware held disks at 42–48°C, so the stock speed needs headroom below the 50°C emergency rule.
+	experimentAbortC = 49
+)
+
+// PWM 38 is the stock firmware speed; 56 is the controller's usual ambient floor.
+var experimentLevels = [2]int{38, 56}
+
 type ExperimentConfig struct {
 	ID            string `json:"id"`
 	RoomURL       string `json:"room_url"`
@@ -20,6 +30,7 @@ type ExperimentStatus struct {
 	ID             string    `json:"id"`
 	Phase          string    `json:"phase"`
 	Block          int       `json:"block"`
+	TotalBlocks    int       `json:"total_blocks"`
 	TargetPWM      int       `json:"target_pwm"`
 	ArmedAt        time.Time `json:"armed_at"`
 	CoolSince      time.Time `json:"cool_since"`
@@ -73,7 +84,8 @@ func newExperiment(parent, id string, now time.Time) (*Experiment, error) {
 		}
 		switch e.status.Phase {
 		case "running":
-			e.stop("aborted", "Process restarted; current block incomplete", now, true)
+			e.status.TotalBlocks = experimentBlocks
+			e.restartBlock("Process restarted", now)
 		case "baseline":
 			e.status.CoolSince = time.Time{}
 			e.transition("baseline", "Process restarted; baseline timer reset", now)
@@ -89,7 +101,7 @@ func newExperiment(parent, id string, now time.Time) (*Experiment, error) {
 				return nil, errors.New("experiment data exists without state")
 			}
 		}
-		e.status = ExperimentStatus{ID: id, Block: -1, ArmedAt: now}
+		e.status = ExperimentStatus{ID: id, Block: -1, TotalBlocks: experimentBlocks, ArmedAt: now}
 		e.transition("baseline", "Waiting for all disks below 40°C for thirty minutes", now)
 	} else {
 		return nil, err
@@ -194,16 +206,27 @@ func (e *Experiment) stop(phase, reason string, now time.Time, recovery bool) {
 	e.transition(phase, reason, now)
 }
 
-// Each two-hour time-of-day slot receives all three speeds across three days.
+// Speeds alternate block by block and flip each day. Every adjacent pair holds both speeds at
+// nearly the same ambient, and every two-hour time-of-day slot gets each speed twice over four days.
 func experimentPWM(block int) int {
-	order := [12]int{2, 0, 1, 2, 1, 0, 1, 2, 0, 1, 0, 2}
-	return [3]int{48, 56, 64}[(order[block%12]+block/12)%3]
+	return experimentLevels[(block%12+block/12)%2]
+}
+
+// restartBlock discards the current block's hold so it is captured again from the start.
+// Losing one block must not cost the rest of a multi-day run.
+func (e *Experiment) restartBlock(reason string, now time.Time) {
+	if e.status.BlockStartedAt.IsZero() {
+		return
+	}
+	e.status.BlockStartedAt = time.Time{}
+	e.transition("running", fmt.Sprintf("%s; restarting block %d of %d", reason, e.status.Block+1, experimentBlocks), now)
 }
 
 func (e *Experiment) decide(now time.Time, s ControllerStatus, t Telemetry, telemetryErr error) *Decision {
 	gap := now.Before(e.lastSeen) || now.Sub(e.lastSeen) > staleAfter
 	e.lastSeen = now
-	valid := s.ReadError == "" && s.WriteError == "" && s.StateError == "" && telemetryErr == nil && t.Room != nil && plausible(*t.Room, -20, 60) && fresh(s.AmbientAt, now) && fresh(s.PWMAt, now) && len(s.Disks) > 0
+	// Cached readings stay valid for staleAfter, so one failed read does not void a block.
+	valid := s.WriteError == "" && s.StateError == "" && fresh(s.AmbientAt, now) && fresh(s.PWMAt, now) && len(s.Disks) > 0
 	hottest := 0.0
 	for _, d := range s.Disks {
 		if d.Standby || d.Temperature == nil || d.Error != "" || !fresh(d.SampledAt, now) {
@@ -218,10 +241,12 @@ func (e *Experiment) decide(now time.Time, s ControllerStatus, t Telemetry, tele
 	}
 	if e.status.Phase == "running" {
 		switch {
-		case hottest >= 45:
-			e.stop("aborted", "Disk reached 45°C; current block incomplete", now, true)
+		case hottest >= experimentAbortC:
+			e.stop("aborted", fmt.Sprintf("Disk reached %d°C; current block incomplete", experimentAbortC), now, true)
 		case !valid || gap:
-			e.stop("aborted", "Missing readings or observation gap; current block incomplete", now, true)
+			// Normal policy supplies fallback cooling; the block restarts once readings return.
+			e.restartBlock("Readings missing", now)
+			return nil
 		case s.DryRun:
 			e.stop("aborted", "Dry-run enabled during experiment; current block incomplete", now, false)
 		case !e.status.BlockStartedAt.IsZero() && s.PWM != [2]int{e.status.TargetPWM, e.status.TargetPWM}:
@@ -245,7 +270,7 @@ func (e *Experiment) decide(now time.Time, s ControllerStatus, t Telemetry, tele
 		e.status.StartedAt = now
 		e.status.Block = 0
 		e.status.TargetPWM = experimentPWM(0)
-		e.transition("running", "Starting block 1 of 36", now)
+		e.transition("running", fmt.Sprintf("Starting block 1 of %d", experimentBlocks), now)
 	}
 	if e.status.Phase != "running" {
 		if e.status.Recovery {
@@ -253,15 +278,15 @@ func (e *Experiment) decide(now time.Time, s ControllerStatus, t Telemetry, tele
 		}
 		return nil
 	}
-	if !e.status.BlockStartedAt.IsZero() && now.Sub(e.status.BlockStartedAt) >= 2*time.Hour {
-		if e.status.Block == 35 {
-			e.transition("completed", "All 36 blocks completed; normal cooling resumed", now)
+	if !e.status.BlockStartedAt.IsZero() && now.Sub(e.status.BlockStartedAt) >= experimentBlock {
+		if e.status.Block == experimentBlocks-1 {
+			e.transition("completed", fmt.Sprintf("All %d blocks completed; normal cooling resumed", experimentBlocks), now)
 			return nil
 		}
 		e.status.Block++
 		e.status.TargetPWM = experimentPWM(e.status.Block)
 		e.status.BlockStartedAt = time.Time{}
-		e.transition("running", fmt.Sprintf("Starting block %d of 36", e.status.Block+1), now)
+		e.transition("running", fmt.Sprintf("Starting block %d of %d", e.status.Block+1, experimentBlocks), now)
 	}
 	if e.status.Phase != "running" {
 		if e.status.Recovery {
@@ -269,7 +294,7 @@ func (e *Experiment) decide(now time.Time, s ControllerStatus, t Telemetry, tele
 		}
 		return nil
 	}
-	return &Decision{e.status.TargetPWM, fmt.Sprintf("Experiment block %d/36", e.status.Block+1), false}
+	return &Decision{e.status.TargetPWM, fmt.Sprintf("Experiment block %d/%d", e.status.Block+1, experimentBlocks), false}
 }
 
 func (e *Experiment) finish(now time.Time, s *ControllerStatus, t Telemetry, telemetryErr error) {
@@ -279,7 +304,7 @@ func (e *Experiment) finish(now time.Time, s *ControllerStatus, t Telemetry, tel
 	if s.Mode != "auto" {
 		e.stop("cancelled", "Manual intervention", now, false)
 	}
-	if e.status.Phase == "running" && (s.ReadError != "" || s.WriteError != "" || s.StateError != "") {
+	if e.status.Phase == "running" && (s.WriteError != "" || s.StateError != "") {
 		e.stop("aborted", "Read/write failure; current block incomplete", now, true)
 	}
 	if e.status.Recovery && s.PWM[0] >= 167 && s.PWM[1] >= 167 && s.WriteError == "" && e.status.Error == "" {
@@ -293,7 +318,7 @@ func (e *Experiment) finish(now time.Time, s *ControllerStatus, t Telemetry, tel
 		if s.LastChange.After(now) {
 			e.status.BlockStartedAt = s.LastChange
 		}
-		e.transition("running", fmt.Sprintf("Holding block %d of 36", e.status.Block+1), now)
+		e.transition("running", fmt.Sprintf("Holding block %d of %d", e.status.Block+1, experimentBlocks), now)
 	}
 	status := e.status
 	s.Experiment = &status
