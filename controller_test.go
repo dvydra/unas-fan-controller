@@ -254,3 +254,22 @@ func TestConcurrentManualWinsOverRunningSample(t *testing.T) {
 		t.Fatal("automatic sample overwrote manual action")
 	}
 }
+
+func TestCupboardOutageDoesNotBlockReductions(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1000, 0)
+	// A missing cupboard sensor once left the fan stuck at fallback speed.
+	f := &fakeHardware{pwm: [2]int{167, 167}, disk: 31, ambient: 22, missing: true}
+	c, _ := testController(t, f, now, false)
+	c.Sample(ctx, now.Add(holdPeriod))
+	if f.pwm != [2]int{quietCeiling, quietCeiling} {
+		t.Fatal("cupboard outage blocked the return to the ceiling", f.pwm, c.Status().Reason)
+	}
+	c.Sample(ctx, now.Add(3*holdPeriod))
+	if f.pwm[0] != quietCeiling-rampStep {
+		t.Fatal("cupboard outage blocked easing off", f.pwm, c.Status().Reason)
+	}
+	if c.Status().ReadError == "" {
+		t.Fatal("cupboard outage hidden from status")
+	}
+}
