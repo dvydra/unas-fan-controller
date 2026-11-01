@@ -214,8 +214,6 @@ func (c *Controller) Sample(ctx context.Context, now time.Time) {
 	if ambientErr == nil {
 		s.Ambient = &ambient
 		s.AmbientAt = now
-	} else {
-		errs = append(errs, ambientErr)
 	}
 	disks, diskErr := c.io.Disks(ctx)
 	if diskErr != nil {
@@ -257,7 +255,8 @@ func (c *Controller) Sample(ctx context.Context, now time.Time) {
 		}
 		s.Disks = append(s.Disks, d)
 	}
-	s.ReadError = errorText(errors.Join(errs...))
+	// The cupboard reading is reported but does not drive speed, so it must not hold the fan up.
+	s.ReadError = errorText(errors.Join(append([]error{ambientErr}, errs...)...))
 	if c.experiment != nil && c.experiment.active() {
 		telemetry, telemetryErr = c.io.Telemetry(ctx)
 		telemetry.SampledAt = now
