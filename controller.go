@@ -267,11 +267,8 @@ func (c *Controller) Sample(ctx context.Context, now time.Time) {
 		s.DesiredPWM = max(pwm[0], pwm[1])
 		return
 	}
-	av := 0.0
-	if s.Ambient != nil {
-		av = *s.Ambient
-	}
-	in := PolicyInput{Now: now, NextOrdinaryAt: s.NextOrdinaryAt, Current: max(pwm[0], pwm[1]), Ambient: av, Hottest: hottest, AmbientValid: fresh(s.AmbientAt, now), DiskValid: allFresh && active > 0}
+	// Cupboard temperature is shown and recorded but no longer drives speed, so a Homebridge outage cannot force fallback cooling.
+	in := PolicyInput{Now: now, NextOrdinaryAt: s.NextOrdinaryAt, Current: max(pwm[0], pwm[1]), Hottest: hottest, DiskValid: allFresh && active > 0}
 	decision := Decide(in)
 	if hotNow {
 		decision = Decision{255, "Disk at or above 50°C", true}

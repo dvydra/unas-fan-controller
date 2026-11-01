@@ -12,7 +12,8 @@ import (
 type fakeHardware struct {
 	pwm           [2]int
 	disk, ambient float64
-	missing       bool
+	missing       bool // cupboard sensor unavailable
+	disksDown     bool // disk temperatures unavailable
 	partial       bool
 	writes        int
 }
@@ -26,6 +27,9 @@ func (f *fakeHardware) io() ControllerIO {
 			return f.ambient, nil
 		},
 		Disks: func(context.Context) ([]DiskReading, error) {
+			if f.disksDown {
+				return nil, errors.New("offline")
+			}
 			v := f.disk
 			return []DiskReading{{Device: "/dev/sda", Temperature: &v}}, nil
 		},
@@ -54,14 +58,14 @@ func testController(t *testing.T, f *fakeHardware, now time.Time, dry bool) (*Co
 func TestControllerHoldRestartAndManual(t *testing.T) {
 	ctx := context.Background()
 	now := time.Unix(1000, 0)
-	f := &fakeHardware{pwm: [2]int{80, 80}, disk: 41, ambient: 23}
+	f := &fakeHardware{pwm: [2]int{80, 80}, disk: 43, ambient: 23}
 	c, cfg := testController(t, f, now, false)
 	c.Sample(ctx, now.Add(holdPeriod-time.Nanosecond))
 	if f.pwm[0] != 80 {
 		t.Fatal("changed before hold")
 	}
 	c.Sample(ctx, now.Add(holdPeriod))
-	if f.pwm != [2]int{96, 96} {
+	if f.pwm != [2]int{84, 84} {
 		t.Fatalf("%v", f.pwm)
 	}
 	c, err := NewController(cfg, f.io(), now.Add(holdPeriod+time.Second))
@@ -69,7 +73,7 @@ func TestControllerHoldRestartAndManual(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Sample(ctx, now.Add(2*holdPeriod-time.Second))
-	if f.pwm[0] != 96 {
+	if f.pwm[0] != 84 {
 		t.Fatal("restart lost hold")
 	}
 	if err = c.SetManual(ctx, 65, now.Add(2*holdPeriod)); err != nil {
@@ -92,7 +96,17 @@ func TestControllerFallbackAndRecovery(t *testing.T) {
 	f := &fakeHardware{pwm: [2]int{38, 38}, disk: 33, ambient: 20}
 	c, _ := testController(t, f, now, false)
 	c.Sample(ctx, now)
+	// The cupboard sensor no longer drives speed, so losing it must not blast the fan.
 	f.missing = true
+	c.Sample(ctx, now.Add(5*time.Minute))
+	if f.pwm[0] != 38 {
+		t.Fatal("cupboard outage forced fallback", f.pwm)
+	}
+	f.missing = false
+	c.Sample(ctx, now.Add(5*time.Minute+30*time.Second))
+	now = now.Add(6 * time.Minute)
+	c.Sample(ctx, now)
+	f.disksDown = true
 	c.Sample(ctx, now.Add(89*time.Second))
 	if f.pwm[0] != 38 {
 		t.Fatal("transient error escalated")
@@ -101,14 +115,14 @@ func TestControllerFallbackAndRecovery(t *testing.T) {
 	if f.pwm != [2]int{167, 167} {
 		t.Fatal("no fallback", f.pwm)
 	}
-	f.missing = false
+	f.disksDown = false
 	c.Sample(ctx, now.Add(91*time.Second))
 	if f.pwm[0] != 167 {
 		t.Fatal("reduced too soon")
 	}
 	c.Sample(ctx, now.Add(91*time.Second+holdPeriod))
-	if f.pwm[0] != 159 {
-		t.Fatal("did not recover gradually", f.pwm)
+	if f.pwm[0] != quietCeiling {
+		t.Fatal("did not return to the half-speed ceiling", f.pwm)
 	}
 	f.missing = true
 	f.disk = 50
