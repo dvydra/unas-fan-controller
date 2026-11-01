@@ -28,7 +28,7 @@ func experimentalController(t *testing.T, f *fakeHardware, now time.Time) (*Cont
 
 func TestExperimentBaselineScheduleAndRestart(t *testing.T) {
 	now := time.Unix(100000, 0)
-	f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
+	f := &fakeHardware{pwm: [2]int{38, 38}, disk: 39, ambient: 22}
 	c, cfg, io := experimentalController(t, f, now)
 	for i := 0; i < 60; i++ {
 		c.Sample(context.Background(), now.Add(time.Duration(i)*30*time.Second))
@@ -63,7 +63,7 @@ func TestExperimentBaselineScheduleAndRestart(t *testing.T) {
 
 func TestExperimentFullSchedule(t *testing.T) {
 	now := time.Unix(100000, 0)
-	f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
+	f := &fakeHardware{pwm: [2]int{38, 38}, disk: 39, ambient: 22}
 	c, _, _ := experimentalController(t, f, now)
 	counts := map[int]int{}
 	previous := -1
@@ -114,7 +114,7 @@ func TestExperimentAbortAndManualCancellation(t *testing.T) {
 	for _, scenario := range []string{"hot", "emergency", "write", "manual"} {
 		t.Run(scenario, func(t *testing.T) {
 			now := time.Unix(100000, 0)
-			f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
+			f := &fakeHardware{pwm: [2]int{38, 38}, disk: 39, ambient: 22}
 			c, cfg, io := experimentalController(t, f, now)
 			for i := 0; i <= 60; i++ {
 				c.Sample(context.Background(), now.Add(time.Duration(i)*30*time.Second))
@@ -178,7 +178,7 @@ func TestExperimentStorageFailureKeepsCooling(t *testing.T) {
 	for _, scenario := range []string{"corrupt", "capture"} {
 		t.Run(scenario, func(t *testing.T) {
 			now := time.Unix(100000, 0)
-			f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
+			f := &fakeHardware{pwm: [2]int{38, 38}, disk: 39, ambient: 22}
 			c, cfg, io := experimentalController(t, f, now)
 			dir := filepath.Join(filepath.Dir(cfg.StatePath), "experiments", "test")
 			if scenario == "corrupt" {
@@ -218,10 +218,10 @@ func TestExperimentStorageFailureKeepsCooling(t *testing.T) {
 
 func TestExperimentBaselineMustBeContinuous(t *testing.T) {
 	now := time.Unix(100000, 0)
-	f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
+	f := &fakeHardware{pwm: [2]int{38, 38}, disk: 39, ambient: 22}
 	c, _, _ := experimentalController(t, f, now)
 	for i := 0; i <= 100; i++ {
-		f.missing = i == 40
+		f.disksDown = i == 40
 		c.Sample(context.Background(), now.Add(time.Duration(i)*30*time.Second))
 	}
 	if c.Status().Experiment.Phase != "baseline" {
@@ -236,7 +236,7 @@ func TestExperimentBaselineMustBeContinuous(t *testing.T) {
 func TestExperimentToleratesReadingLoss(t *testing.T) {
 	start := func(t *testing.T) (*Controller, *fakeHardware, time.Time) {
 		now := time.Unix(100000, 0)
-		f := &fakeHardware{pwm: [2]int{80, 80}, disk: 39, ambient: 22}
+		f := &fakeHardware{pwm: [2]int{38, 38}, disk: 39, ambient: 22}
 		c, _, _ := experimentalController(t, f, now)
 		for i := 0; i <= 80; i++ {
 			c.Sample(context.Background(), now.Add(time.Duration(i)*30*time.Second))
@@ -263,9 +263,10 @@ func TestExperimentToleratesReadingLoss(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			c, f, now := start(t)
 			block := c.Status().Experiment.Block
+			held := c.Status().Experiment.BlockStartedAt
 			next := now.Add(30 * time.Second)
 			if scenario == "missing" {
-				f.missing = true
+				f.disksDown = true
 				for i := 1; i <= 4; i++ {
 					next = now.Add(time.Duration(i) * 30 * time.Second)
 					c.Sample(context.Background(), next)
@@ -273,12 +274,13 @@ func TestExperimentToleratesReadingLoss(t *testing.T) {
 				if f.pwm[0] < 167 {
 					t.Fatal("lost readings did not fall back to safe cooling", f.pwm)
 				}
-				f.missing = false
+				f.disksDown = false
 			} else {
 				next = now.Add(5 * time.Minute)
 				c.Sample(context.Background(), next)
 			}
-			if e := c.Status().Experiment; e.Phase != "running" || e.Block != block || !e.BlockStartedAt.IsZero() {
+			// At stock speed the restarted block may begin holding again in the same tick.
+			if e := c.Status().Experiment; e.Phase != "running" || e.Block != block || !e.BlockStartedAt.IsZero() && !e.BlockStartedAt.After(held) {
 				t.Fatal("lost readings must restart the block, not abort or keep its data", e)
 			}
 			for i := 1; i <= 25; i++ {
